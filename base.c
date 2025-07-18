@@ -285,7 +285,7 @@ int show_bmp(char *bmp_name,struct Dev_init *dev)
 
     int r,g,b,color;
     int i=0;
-    for(int y = 400;y<479;y++)
+    for(int y = 0;y<480;y++)
     {
         for(int x = 0;x<800;x++)
         {
