@@ -11,6 +11,8 @@
 #include <pthread.h>        // 线程
 #include <mqueue.h>         // POSIX 消息队列
 
+#define MAX_QUEUE_SIZE 10
+
 //---------------- 系统状态定义 ----------------
 typedef enum {
     SYS_MAIN_MENU,          // 主菜单
@@ -20,6 +22,17 @@ typedef enum {
     SYS_GARAGE_CAM,         // 车库摄像头
     SYS_LICENSE_PLATE       // 车牌识别
 } SystemState;
+
+// 线程安全的环形队列
+typedef struct {
+    SystemMessage messages[MAX_QUEUE_SIZE];
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t lock;
+    pthread_cond_t not_empty; // 队列非空条件
+    pthread_cond_t not_full;  // 队列未满条件
+} ThreadSafeQueue;
 
 //---------------- 消息类型标识 ----------------
 typedef enum {
@@ -89,7 +102,7 @@ typedef struct {
 
 //---------------- 全局变量与函数声明 ----------------
 volatile SystemState current_state = SYS_MAIN_MENU; // 当前系统状态
-mqd_t system_queue;                                 // 消息队列句柄
+ThreadSafeQueue system_queue;
 pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER; // 状态互斥锁
 ProgressBar bar = {401, 15, 800, 0x00FF69B4};// 进度条对象
 const SystemPaths sys_paths = // 全局设备路径
@@ -120,10 +133,17 @@ void* touch_monitor_thread(void* arg);
 //进度条刷新线程
 void *progress_thread(void *arg);
 
+
 // 状态切换函数
 void change_state(SystemState new_state);
+//初始化消息队列
+void queue_init();
+// 销毁队列资源
+void queue_destroy();
 // 消息发送函数
 void send_message(SystemMessage msg);
+//消息接收
+int receive_message(SystemMessage *msg, int timeout_ms);
 //初始化屏幕
 int dev_init(struct Dev_init *dev);
 //关闭屏幕
@@ -144,23 +164,8 @@ void switch_video(VideoContext *ctx, int direction);
 
 int main()
 {
-    // 创建系统消息队列
-    struct mq_attr attr = 
-    {
-        .mq_flags = 0,
-        .mq_maxmsg = 10,
-        .mq_msgsize = sizeof(SystemMessage)
-    };
-    // 确保消息队列不存在
-    mq_unlink("/system_queue");
-    system_queue = mq_open("/system_queue", O_CREAT | O_RDWR, 0644, &attr);
-    
-    if(system_queue == (mqd_t)-1) 
-    {
-        perror("消息队列创建失败");
-        return 1;
-    }
-
+    // 初始化队列
+    queue_init();
     // 创建触摸监测线程
     pthread_t touch_thread;
     pthread_create(&touch_thread, NULL, touch_monitor_thread, NULL);
@@ -207,21 +212,87 @@ int main()
         
         // 检查状态变化 - 通过消息队列接收状态切换命令
         SystemMessage msg;
-        if(mq_receive(system_queue, (char*)&msg, sizeof(SystemMessage), NULL) > 0) 
-        {
-            if(msg.type == MSG_SYSTEM_CMD) 
+        if (receive_message(&msg, 100)) 
+        { 
+            if (msg.type == MSG_SYSTEM_CMD) 
             {
                 change_state(msg.data.system_cmd);
             }
         }
     }
-    
-    mq_close(system_queue);
-    mq_unlink("/system_queue");
+    // 销毁队列资源
+    queue_destroy();
     return 0;
 }
 
 //---------------- 函数实现 ----------------
+//初始化消息队列
+void queue_init() 
+{
+    system_queue.head = 0;
+    system_queue.tail = 0;
+    system_queue.count = 0;
+    pthread_mutex_init(&system_queue.lock, NULL);
+    pthread_cond_init(&system_queue.not_empty, NULL);
+    pthread_cond_init(&system_queue.not_full, NULL);
+}
+// 发送消息 (替代 mq_send)
+void send_message(SystemMessage msg) 
+{
+    pthread_mutex_lock(&system_queue.lock);
+    
+    // 等待队列有空间
+    while (system_queue.count >= MAX_QUEUE_SIZE) {
+        pthread_cond_wait(&system_queue.not_full, &system_queue.lock);
+    }
+    
+    system_queue.messages[system_queue.tail] = msg;
+    system_queue.tail = (system_queue.tail + 1) % MAX_QUEUE_SIZE;
+    system_queue.count++;
+    
+    // 通知消费者
+    pthread_cond_signal(&system_queue.not_empty);
+    pthread_mutex_unlock(&system_queue.lock);
+}
+
+// 接收消息 (替代 mq_receive)
+int receive_message(SystemMessage *msg, int timeout_ms) 
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += timeout_ms * 1000000;
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec += ts.tv_nsec / 1000000000;
+        ts.tv_nsec %= 1000000000;
+    }
+    
+    pthread_mutex_lock(&system_queue.lock);
+    
+    int ret = 0;
+    while (system_queue.count == 0) {
+        if (pthread_cond_timedwait(&system_queue.not_empty, &system_queue.lock, &ts) != 0) {
+            // 超时
+            pthread_mutex_unlock(&system_queue.lock);
+            return 0;
+        }
+    }
+    
+    *msg = system_queue.messages[system_queue.head];
+    system_queue.head = (system_queue.head + 1) % MAX_QUEUE_SIZE;
+    system_queue.count--;
+    
+    // 通知生产者
+    pthread_cond_signal(&system_queue.not_full);
+    pthread_mutex_unlock(&system_queue.lock);
+    return 1;
+}
+// 销毁队列资源
+void queue_destroy() 
+{
+    pthread_mutex_destroy(&system_queue.lock);
+    pthread_cond_destroy(&system_queue.not_empty);
+    pthread_cond_destroy(&system_queue.not_full);
+}
 // 状态切换函数
 void change_state(SystemState new_state) 
 {
@@ -229,12 +300,6 @@ void change_state(SystemState new_state)
     printf("状态切换: %d -> %d\n", current_state, new_state);
     current_state = new_state;
     pthread_mutex_unlock(&state_mutex);
-}
-
-// 消息发送函数
-void send_message(SystemMessage msg) 
-{
-    mq_send(system_queue, (const char*)&msg, sizeof(SystemMessage), 0);
 }
 
 //初始化屏幕
