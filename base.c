@@ -129,7 +129,7 @@ int dev_init(struct Dev_init *dev);
 //关闭屏幕
 void dev_close(struct Dev_init *dev);
 //显示bmp图片
-int show_bmp(char *bmp_name,struct Dev_init *dev);
+int show_bmp(char *bmp_name,struct Dev_init *dev, int xbegin, int xend, int ybegin, int yend);
 //获取点击和滑动
 int read_Touch(int touch_fd, int *x ,int *y);
 //---------------- 视频播放相关模块 ----------------
@@ -265,7 +265,7 @@ void dev_close(struct Dev_init *dev)
 }
 
 //显示bmp图片
-int show_bmp(char *bmp_name,struct Dev_init *dev)
+int show_bmp(char *bmp_name,struct Dev_init *dev, int xbegin, int xend, int ybegin, int yend)
 {
      //打开bmp图片
     int bmp_fd = open(bmp_name,O_RDWR);
@@ -285,9 +285,9 @@ int show_bmp(char *bmp_name,struct Dev_init *dev)
 
     int r,g,b,color;
     int i=0;
-    for(int y = 0;y<480;y++)
+    for(int y = ybegin; y < yend; y++)
     {
-        for(int x = 0;x<800;x++)
+        for(int x = xbegin; x < xend; x++)
         {
             b = bmp_buf[i++];
             g = bmp_buf[i++];
@@ -499,7 +499,7 @@ void* photo_album(void* arg)
 }
 void* audio_player(void* arg)
 {
-
+    
 }
 void* video_player(void* arg)
 {
